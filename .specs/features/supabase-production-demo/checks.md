@@ -94,3 +94,7 @@ Proof: `node --test --test-name-pattern "^C18 " tests/database.test.mjs`
 Estimativa: arquivos novos de SQL/testes/scripts/docs ~60 KB / 4 = 15k tokens; contexto da referência ~25k; total ~40k < budget 150k. Um builder; nenhuma divisão necessária. Perfil light conforme default aprovado; standard não foi explicitamente selecionado.
 
 Autorização remota: projeto xitazriytooyqetfjiki, credenciais temporárias e aplicação autorizadas pelo usuário em 2026-10-06. Nenhum reset remoto.
+
+- **Boundary:** C1-C18 closed by local proofs (18/18), pending independent verification.
+- **Settled mid-build:** remote keys/application and automatic RLS authorized; trusted CA pinned, local fixtures corrected without weakening values; profile remains light.
+- **Abandoned:** none.

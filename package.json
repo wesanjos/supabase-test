@@ -1,0 +1,19 @@
+{
+  "name": "supabase-production-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:start": "supabase start -x realtime,storage-api,imgproxy,mailpit,postgres-meta,studio,edge-runtime,logflare,vector,supavisor",
+    "db:reset": "supabase db reset --local",
+    "db:stop": "supabase stop",
+    "test": "node --test tests/database.test.mjs",
+    "db:apply": "node --env-file=.env.remote scripts/apply.mjs",
+    "db:inspect": "node --env-file=.env.remote scripts/inspect.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "supabase": "^2.120.0"
+  }
+}
