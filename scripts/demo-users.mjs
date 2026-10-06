@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 const base=process.env.SUPABASE_URL;
-const key=process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SECRET_KEY;
+const key=process.env.SUPABASE_SECRET_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY;
 assert.ok(base && key,'Configure server-side Supabase URL and key');
 const emails=['owner','admin','billing','active','active2','expired','blocked','trial'];
 const path='.env.demo';

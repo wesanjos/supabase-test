@@ -11,7 +11,7 @@
 ## Handoff
 
 **Feature**: supabase-production-demo
-**Where**: C1-C18 passam localmente; perfil light.
-**Next step**: verificação independente; aplicar no projeto remoto autorizado após PASS.
-**Blockers**: none; conexão remota TLS verificada e projeto vazio confirmado.
+**Where**: C1-C18 revisados com PASS independente em 6544f1e; remoto criado e verificado (56 checks HTTP).
+**Next step**: rodada 3 independente sobre prioridade de Secret Key e relatório remoto; nenhum deploy pendente.
+**Blockers**: none; remoto aplicado, oito tabelas com RLS e RLS automático ativo.
 **Branch**: main

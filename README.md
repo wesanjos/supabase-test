@@ -31,6 +31,9 @@ npm run db:inspect
 node --env-file=.env.remote scripts/demo-users.mjs
 ```
 
+Script de contas prioriza Secret Key atual; service_role JWT serve como fallback.
+As chaves legadas fornecidas para este projeto foram rejeitadas pela API.
+
 Aplicação exige projeto vazio, não sobrescreve tabelas/usuários existentes e grava
 migração/seed/recibo na mesma transação. Reexecução com mesmo conteúdo não duplica
 registros. Não executa reset remoto. Inspeção imprime somente estrutura/proteções.

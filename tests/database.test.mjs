@@ -3,7 +3,9 @@ import { test } from 'node:test';
 import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
+import { createServer } from 'node:http';
+import { promisify } from 'node:util';
 import pg from 'pg';
 
 const url = process.env.TEST_DATABASE_URL ?? 'postgresql://postgres:postgres@127.0.0.1:54322/postgres';
@@ -266,4 +268,26 @@ test('demo Auth API accepts every seeded account', async () => {
     const r=await fetch(`${settings.API_URL}/auth/v1/admin/users/${user(n)}`,{headers:{apikey:settings.SERVICE_ROLE_KEY,Authorization:`Bearer ${settings.SERVICE_ROLE_KEY}`},signal:AbortSignal.timeout(15000)});
     assert.equal(r.status,200,`Auth user ${n}`); assert.equal((await r.json()).id,user(n));
   }
+});
+
+// Current hosted projects may retire legacy JWT keys while keeping secret keys.
+test('demo login script prefers current secret key over legacy JWT', async () => {
+  const scratch=mkdtempSync(join(tmpdir(),'supabase-demo-keys-'));
+  const emails=['owner','admin','billing','active','active2','expired','blocked','trial'];
+  const received=[];
+  const server=createServer((req,res)=>{
+    received.push(req.headers.apikey);
+    if(req.headers.apikey!=='sb_secret_mock_current') {res.writeHead(401).end();return;}
+    const n=Number(req.url.split('/').at(-1).slice(-12));
+    res.writeHead(200,{'Content-Type':'application/json'});
+    res.end(JSON.stringify({id:user(n),email:emails[n-1]+'@example.com'}));
+  });
+  try {
+    await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+    const env={...process.env,SUPABASE_URL:`http://127.0.0.1:${server.address().port}`,SUPABASE_SECRET_KEY:'sb_secret_mock_current',SUPABASE_SERVICE_ROLE_KEY:'legacy_invalid'};
+    delete env.NODE_TEST_CONTEXT;
+    await promisify(execFile)(process.execPath,[new URL('../scripts/demo-users.mjs',import.meta.url).pathname],{cwd:scratch,env});
+    assert.equal(received.length,16); assert.ok(received.every(key=>key==='sb_secret_mock_current'));
+    assert.match(readFileSync(join(scratch,'.env.demo'),'utf8'),/^DEMO_USER_PASSWORD=[A-Za-z0-9_-]{32}\n$/);
+  } finally { await new Promise(resolve=>server.close(resolve)); rmSync(scratch,{recursive:true,force:true}); }
 });
