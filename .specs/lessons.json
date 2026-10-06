@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "promote_threshold": 2,
+  "window_days": 45,
+  "quarantine_threshold": 2,
+  "next_id": 3,
+  "lessons": [
+    {
+      "id": "L-001",
+      "key": "ac_gap::provas de auditoria devem ligar cada operacao a entidade ator alvo e instante nos eventos novos nao buscar operacao em historico inteiro",
+      "text": "Provas de auditoria devem ligar cada operação à entidade, ator, alvo e instante nos eventos novos, não buscar operação em histórico inteiro.",
+      "signal": "ac_gap",
+      "scope": "database",
+      "status": "candidate",
+      "features": [
+        "supabase-production-demo"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        ".specs/features/supabase-production-demo/verification.md:C15 (database)"
+      ],
+      "created": "2026-10-06T23:43:17Z",
+      "last_seen": "2026-10-06T23:43:17Z"
+    },
+    {
+      "id": "L-002",
+      "key": "ac_gap::reprodutibilidade exige executar reset e reexecutar provas verificar string do comando nao prova execucao",
+      "text": "Reprodutibilidade exige executar reset e reexecutar provas; verificar string do comando não prova execução.",
+      "signal": "ac_gap",
+      "scope": "database",
+      "status": "candidate",
+      "features": [
+        "supabase-production-demo"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        ".specs/features/supabase-production-demo/verification.md:C17 (database)"
+      ],
+      "created": "2026-10-06T23:43:17Z",
+      "last_seen": "2026-10-06T23:43:17Z"
+    }
+  ]
+}

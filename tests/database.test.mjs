@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import pg from 'pg';
 
@@ -186,10 +188,19 @@ test('C15 audit events are transactional and contain no sensitive payload', () =
   await c.query("delete from user_roles where user_id=$1 and role='member'",[user(6)]);
   await c.query('update additional_member_entitlements set status=status');
   await c.query('reset role');
+  await c.query("update user_roles set role='member' where user_id=$1 and role='billing_admin'",[user(3)]);
   await c.query('insert into additional_member_entitlements(owner_id,member_id,status) values($1,$2,$3)',[user(4),user(5),'pending']);
   await c.query("delete from additional_member_entitlements where status='pending' and member_id=$1",[user(5)]);
-  const events=(await c.query('select actor_id,entity,operation from private.admin_audit_log order by created_at,id')).rows;
-  assert.equal(events.length,base+6);
+  const events=(await c.query('select actor_id,entity,target_id,operation,created_at from private.admin_audit_log order by created_at,id')).rows;
+  assert.equal(events.length,base+7);
+  const fresh=events.slice(base);
+  for(const event of fresh) {assert.ok(event.created_at instanceof Date); assert.ok(event.target_id);}
+  assert.ok(fresh.some(x=>x.entity==='user_roles'&&x.operation==='INSERT'&&x.actor_id===user(1)&&x.target_id===user(6)+':member'));
+  assert.ok(fresh.some(x=>x.entity==='user_roles'&&x.operation==='DELETE'&&x.actor_id===user(1)&&x.target_id===user(6)+':member'));
+  assert.ok(fresh.some(x=>x.entity==='user_roles'&&x.operation==='UPDATE'&&x.actor_id===user(1)&&x.target_id===user(3)+':member'));
+  assert.equal(fresh.filter(x=>x.entity==='additional_member_entitlements'&&x.operation==='UPDATE'&&x.actor_id===user(1)).length,2);
+  for(const op of ['INSERT','DELETE']) assert.ok(fresh.some(x=>x.entity==='additional_member_entitlements'&&x.operation===op&&x.actor_id===user(1)));
+  assert.ok(events.some(x=>x.entity==='user_roles'&&x.operation==='UPDATE'));
   for(const operation of ['INSERT','UPDATE','DELETE']) assert.ok(events.some(x=>x.operation===operation));
   assert.ok(events.some(x=>x.actor_id===user(1)&&x.entity==='user_roles'));
   const cols=(await c.query("select column_name from information_schema.columns where table_schema='private' and table_name='admin_audit_log'")).rows.map(x=>x.column_name);
@@ -210,12 +221,25 @@ test('C16 missing identity invalid AAL and forged metadata cannot elevate', () =
   for(const h of helpers) { assert.ok(!h.args.includes('uuid')); assert.ok(h.proconfig.some(x=>x.startsWith('search_path='))); }
 }));
 
-test('C17 reset artifacts and failing runner remain executable', () => {
+test('C17 reset artifacts and failing runner remain executable', async () => {
   const pkg=JSON.parse(readFileSync('package.json','utf8'));
   assert.equal(pkg.scripts['db:reset'],'supabase db reset --local');
   assert.ok(existsSync('supabase/config.toml')); assert.ok(existsSync('supabase/seed.sql'));
   const doc=readFileSync('README.md','utf8'); for(const token of ['npm run db:reset','npm test','AAL2','service_role','mock']) assert.ok(doc.includes(token),token);
-  assert.throws(()=>execFileSync(process.execPath,['--input-type=module','-e',"import assert from 'node:assert/strict'; assert.equal(1,2)"],{stdio:'ignore'}),e=>e.status!==0);
+  const output=execFileSync('npm',['run','db:reset'],{encoding:'utf8',stdio:['ignore','pipe','pipe'],timeout:120000});
+  assert.match(output,/Finished supabase db reset|Reset local database/);
+  await tx(async c=>{
+    for(const [table,expected] of [['auth.users',8],['profiles',8],['user_roles',5],['modules',4],['module_credentials',4],['asaas_test_plans',2],['asaas_payments',4],['additional_member_entitlements',2]]) assert.equal(await count(c,table),expected,table);
+  });
+  const scratch=mkdtempSync(join(tmpdir(),'supabase-demo-runner-'));
+  try {
+    const fixture=join(scratch,'failure.test.mjs');
+    writeFileSync(fixture,"import {test} from 'node:test'; import assert from 'node:assert/strict'; test('intentional failure',()=>assert.equal(1,2));\n");
+    const childEnv={...process.env}; delete childEnv.NODE_TEST_CONTEXT;
+    const rerun=execFileSync(process.execPath,['--test','--test-name-pattern','^C(?!17 )[0-9]+ ','tests/database.test.mjs'],{encoding:'utf8',stdio:['ignore','pipe','pipe'],env:childEnv});
+    for(const number of [...Array(16)].map((_,i)=>i+1).concat(18)) assert.match(rerun,new RegExp(`C${number} `));
+    assert.throws(()=>execFileSync(process.execPath,['--test',fixture],{stdio:'ignore',env:childEnv}),e=>e.status===1);
+  } finally {rmSync(scratch,{recursive:true,force:true});}
 });
 
 test('C18 new public and private tables get RLS automatically', () => tx(async c => {
@@ -233,3 +257,13 @@ test('C18 new public and private tables get RLS automatically', () => tx(async c
     assert.equal((await authClient.query("select relrowsecurity from pg_class where oid='auth.rls_probe'::regclass")).rows[0].relrowsecurity,false);
   } finally { await authClient.query('rollback'); await authClient.end(); }
 }));
+
+// Regression: SQL seed must remain readable by GoTrue, not only by PostgreSQL.
+test('demo Auth API accepts every seeded account', async () => {
+  const childEnv={...process.env}; delete childEnv.NODE_TEST_CONTEXT;
+  const settings=JSON.parse(execFileSync('npx',['supabase','status','-o','json'],{encoding:'utf8',stdio:['ignore','pipe','pipe'],env:childEnv}));
+  for(let n=1;n<=8;n++) {
+    const r=await fetch(`${settings.API_URL}/auth/v1/admin/users/${user(n)}`,{headers:{apikey:settings.SERVICE_ROLE_KEY,Authorization:`Bearer ${settings.SERVICE_ROLE_KEY}`},signal:AbortSignal.timeout(15000)});
+    assert.equal(r.status,200,`Auth user ${n}`); assert.equal((await r.json()).id,user(n));
+  }
+});

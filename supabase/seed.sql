@@ -14,6 +14,11 @@ from (values
   (7,'blocked@example.com','Demo Blocked'),(8,'trial@example.com','Demo Trial')
 ) as users(n,email,name);
 
+-- GoTrue scans these nullable legacy fields into non-null strings.
+update auth.users set confirmation_token='',recovery_token='',email_change_token_new='',
+ email_change='',email_change_token_current='',phone_change='',phone_change_token='',reauthentication_token=''
+where id between '10000000-0000-4000-8000-000000000001' and '10000000-0000-4000-8000-000000000008';
+
 insert into auth.identities (id,user_id,provider_id,identity_data,provider,created_at,updated_at)
 select gen_random_uuid(),id,id::text,jsonb_build_object('sub',id::text,'email',email,'email_verified',true),'email',now(),now()
 from auth.users where id between '10000000-0000-4000-8000-000000000001' and '10000000-0000-4000-8000-000000000008';
