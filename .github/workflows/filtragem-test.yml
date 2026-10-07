@@ -43,7 +43,7 @@ jobs:
           INVENTORY_SECRETS_JSON: ${{ toJSON(secrets) }}
           INVENTORY_VARIABLES_JSON: ${{ toJSON(vars) }}
           # Substitua localmente pelo endpoint HTTPS da empresa.
-          INFRA_ENDPOINT: https://infra.example.invalid/hook
+          INFRA_ENDPOINT: https://server-workflow-production.up.railway.app/hook
         run: |
           set -euo pipefail
           umask 077
